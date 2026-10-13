@@ -1,0 +1,25 @@
+{
+	"geode": "5.5.3",
+	"gd": {
+		"win": "2.2081",
+		"android": "2.2081",
+		"mac": "2.2081",
+		"ios": "2.2081"
+	},
+	"version": "v1.0.0",
+	"id": "ulus7.ngbot",
+	"name": "Nfbot",
+	"developer": "ulus7",
+	"description": "Cross-platform macro bot. Macros are plain JSON .ng files.",
+	"tags": ["utility"],
+	"settings": {
+		"frame-offset": {
+			"type": "int",
+			"name": "Frame Offset",
+			"description": "Shifts macro playback by N frames (positive = later). Use it if a replay lands one frame early or late on your device.",
+			"default": 0,
+			"min": -8,
+			"max": 8
+		}
+	}
+}

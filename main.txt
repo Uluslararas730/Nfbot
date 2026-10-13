@@ -1,0 +1,235 @@
+// Nfbot - Geode glue. All macro logic lives in src/core (unit-tested, Geode-free);
+// this file only connects it to the game: record via handleButton, replay via
+// processCommands, and a pause-menu panel that works on desktop and mobile alike.
+#include <Geode/Geode.hpp>
+#include <Geode/modify/GJBaseGameLayer.hpp>
+#include <Geode/modify/PauseLayer.hpp>
+#include <Geode/modify/PlayLayer.hpp>
+
+#include <cctype>
+#include <filesystem>
+#include <string>
+
+#include "Macro.hpp"
+
+using namespace geode::prelude;
+
+namespace nf {
+
+enum class Mode { Idle, Record, Play };
+
+struct State {
+    Mode mode = Mode::Idle;
+    Macro macro;
+    Cursor cursor{macro};
+    bool injecting = false;  // true while we feed recorded inputs to the game
+
+    static State& get() {
+        static State s;
+        return s;
+    }
+};
+
+inline int frameOffset() {
+    return static_cast<int>(Mod::get()->getSettingValue<int64_t>("frame-offset"));
+}
+
+inline int currentFrame(GJBaseGameLayer* layer) {
+    return layer->m_gameState.m_currentProgress;
+}
+
+inline std::string safeName(std::string name) {
+    for (char& c : name) {
+        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '_') c = '_';
+    }
+    return name.empty() ? std::string("level") : name;
+}
+
+inline std::filesystem::path macroPath(PlayLayer* pl) {
+    std::string name = safeName(std::string(pl->m_level->m_levelName));
+    int id = pl->m_level->m_levelID.value();
+    return Mod::get()->getSaveDir() / "macros" / fmt::format("{}_{}.ng", name, id);
+}
+
+inline void fillMeta(PlayLayer* pl) {
+    auto& m = State::get().macro;
+    m.levelId = pl->m_level->m_levelID.value();
+    m.levelName = std::string(pl->m_level->m_levelName);
+    m.author = std::string(GJAccountManager::sharedState()->m_username);
+    m.gameVersion = GEODE_GD_VERSION_STRING;
+    m.modVersion = Mod::get()->getVersion().toVString();
+    m.createdAt = isoNow();
+    m.tps = 240.0;
+}
+
+}  // namespace nf
+
+// ------------------------------------------------------------------ gameplay
+
+class $modify(NfGameLayer, GJBaseGameLayer) {
+    // Every button press/release goes through here (both physical input and our
+    // own injected replay input).
+    void handleButton(bool down, int button, bool isPlayer1) {
+        auto& s = nf::State::get();
+        if (!PlayLayer::get() || s.mode == nf::Mode::Idle) {
+            GJBaseGameLayer::handleButton(down, button, isPlayer1);
+            return;
+        }
+        if (s.mode == nf::Mode::Play && !s.injecting) return;  // the macro drives the player
+        if (s.mode == nf::Mode::Record && !s.injecting) {
+            s.macro.addInput(nf::currentFrame(this), button, down, !isPlayer1);
+        }
+        GJBaseGameLayer::handleButton(down, button, isPlayer1);
+    }
+
+    // Runs once per physics step: feed every input that is due on this frame.
+    void processCommands(float dt) {
+        auto& s = nf::State::get();
+        if (s.mode == nf::Mode::Play && PlayLayer::get()) {
+            s.injecting = true;
+            s.cursor.dispatchDue(nf::currentFrame(this), nf::frameOffset(), [this](const nf::Input& in) {
+                GJBaseGameLayer::handleButton(in.down, in.button, !in.player2);
+            });
+            s.injecting = false;
+        }
+        GJBaseGameLayer::processCommands(dt);
+    }
+};
+
+class $modify(NfPlayLayer, PlayLayer) {
+    // Fires on full restart AND when a practice checkpoint is loaded; in both cases
+    // the game state's frame counter now holds the frame we rewound to.
+    void resetLevel() {
+        PlayLayer::resetLevel();
+        auto& s = nf::State::get();
+        int frame = nf::currentFrame(this);
+        if (s.mode == nf::Mode::Record) {
+            s.macro.truncateFrom(frame);  // drop the "future" of the abandoned attempt
+            if (frame == 0) nf::fillMeta(this);
+        } else if (s.mode == nf::Mode::Play) {
+            s.cursor.seek(frame, nf::frameOffset());
+        }
+    }
+};
+
+// ------------------------------------------------------------------- pause UI
+
+class $modify(NfPauseLayer, PauseLayer) {
+    void customSetup() {
+        PauseLayer::customSetup();
+        auto* pl = PlayLayer::get();
+        if (!pl) return;
+
+        auto makeSprite = [](const char* text) {
+            return ButtonSprite::create(text, 110, true, "bigFont.fnt", "GJ_button_01.png", 30.f, 0.8f);
+        };
+
+        auto* recSprite = makeSprite("Record: OFF");
+        auto* playSprite = makeSprite("Play: OFF");
+
+        auto refresh = [recSprite, playSprite]() {
+            auto& s = nf::State::get();
+            recSprite->setString(s.mode == nf::Mode::Record ? "Record: ON" : "Record: OFF");
+            playSprite->setString(s.mode == nf::Mode::Play ? "Play: ON" : "Play: OFF");
+        };
+        refresh();
+
+        auto* recItem = CCMenuItemExt::createSpriteExtra(recSprite, [refresh](CCMenuItemSpriteExtra*) {
+            auto& s = nf::State::get();
+            if (s.mode == nf::Mode::Record) {
+                s.mode = nf::Mode::Idle;
+            } else {
+                s.mode = nf::Mode::Record;
+                s.macro = nf::Macro();
+                if (auto* p = PlayLayer::get()) nf::fillMeta(p);
+                Notification::create("Recording - restart the level to record from frame 0",
+                                     NotificationIcon::Info)->show();
+            }
+            refresh();
+        });
+
+        auto* playItem = CCMenuItemExt::createSpriteExtra(playSprite, [refresh](CCMenuItemSpriteExtra*) {
+            auto& s = nf::State::get();
+            if (s.mode == nf::Mode::Play) {
+                s.mode = nf::Mode::Idle;
+            } else {
+                if (s.macro.inputs.empty()) {
+                    Notification::create("No macro loaded or recorded yet", NotificationIcon::Error)->show();
+                    return;
+                }
+                s.mode = nf::Mode::Play;
+                if (auto* p = PlayLayer::get()) s.cursor.seek(nf::currentFrame(p), nf::frameOffset());
+                Notification::create("Playing - restart the level to replay from frame 0",
+                                     NotificationIcon::Info)->show();
+            }
+            refresh();
+        });
+
+        // Advance exactly one physics frame while paused (watch a macro frame by frame).
+        auto* stepItem = CCMenuItemExt::createSpriteExtra(makeSprite("Step 1 frame"), [](CCMenuItemSpriteExtra*) {
+            auto* p = PlayLayer::get();
+            if (!p) return;
+            const float dt = 1.f / static_cast<float>(nf::State::get().macro.tps);
+            const int before = nf::currentFrame(p);
+            // update() keeps a time remainder, so one call can produce 0 steps; retry a few times.
+            for (int i = 0; i < 4 && nf::currentFrame(p) == before; ++i) p->update(dt);
+        });
+
+        auto* saveItem = CCMenuItemExt::createSpriteExtra(makeSprite("Save .ng"), [](CCMenuItemSpriteExtra*) {
+            auto* p = PlayLayer::get();
+            auto& s = nf::State::get();
+            if (!p) return;
+            if (s.macro.inputs.empty()) {
+                Notification::create("Nothing to save yet", NotificationIcon::Error)->show();
+                return;
+            }
+            auto path = nf::macroPath(p);
+            std::error_code ec;
+            std::filesystem::create_directories(path.parent_path(), ec);
+            auto res = utils::file::writeString(path, s.macro.serialize());
+            if (res.isErr()) {
+                Notification::create("Save failed", NotificationIcon::Error)->show();
+                log::error("Nfbot: could not write {}", path.string());
+                return;
+            }
+            Notification::create(fmt::format("Saved {} inputs", s.macro.inputs.size()),
+                                 NotificationIcon::Success)->show();
+        });
+
+        auto* loadItem = CCMenuItemExt::createSpriteExtra(makeSprite("Load .ng"), [](CCMenuItemSpriteExtra*) {
+            auto* p = PlayLayer::get();
+            if (!p) return;
+            auto path = nf::macroPath(p);
+            auto text = utils::file::readString(path);
+            if (text.isErr()) {
+                Notification::create("No saved macro for this level", NotificationIcon::Error)->show();
+                return;
+            }
+            nf::Macro loaded;
+            std::string err;
+            if (!nf::Macro::deserialize(text.unwrap(), loaded, err)) {
+                log::error("Nfbot: bad macro file {}: {}", path.string(), err);
+                FLAlertLayer::create("Nfbot", fmt::format("Could not load macro:\n{}", err), "OK")->show();
+                return;
+            }
+            auto& s = nf::State::get();
+            s.macro = std::move(loaded);
+            s.cursor.seek(0, nf::frameOffset());
+            Notification::create(fmt::format("Loaded {} inputs", s.macro.inputs.size()),
+                                 NotificationIcon::Success)->show();
+        });
+
+        auto* menu = CCMenu::create();
+        menu->setID("nfbot-menu"_spr);
+        menu->setPosition({0.f, 0.f});
+        auto winSize = CCDirector::get()->getWinSize();
+        CCMenuItemSpriteExtra* items[] = {recItem, playItem, stepItem, saveItem, loadItem};
+        float y = winSize.height / 2.f + 2.f * 34.f;
+        for (auto* item : items) {
+            item->setPosition({85.f, y});
+            menu->addChild(item);
+            y -= 34.f;
+        }
+        this->addChild(menu);
+    }
+};
